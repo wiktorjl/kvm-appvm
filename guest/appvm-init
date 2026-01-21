@@ -1,0 +1,225 @@
+#!/bin/bash
+# appvm-init - Guest initialization script for kvm-appvm VMs
+#
+# This script runs early in boot (before user sessions) and:
+# 1. Sets hostname based on VM name (from DMI data)
+# 2. For Work VMs (detected by appvm-private labeled disk):
+#    a. Mounts the private disk at /rw
+#    b. On cold start: creates home directories and /usr/local structure
+#    c. Bind mounts /rw/home -> /home and /rw/usrlocal -> /usr/local
+#
+# Install to: /usr/local/bin/appvm-init
+# Requires: appvm-init.service systemd unit
+
+set -e
+
+LOG_DIR="/var/log/kvm-appvm"
+LOG_FILE="$LOG_DIR/guest-init.log"
+MOUNT_POINT="/rw"
+CONFIG_FILE="/etc/appvm/config"
+
+# Default configuration values
+DEFAULT_PRIVATE_LABEL="appvm-private"
+DEFAULT_MIN_UID="1000"
+DEFAULT_HOME_BASE="/home"
+
+# Ensure log directory exists
+mkdir -p "$LOG_DIR" 2>/dev/null || true
+
+# Read value from INI config file
+# Usage: read_config <section> <key> <default>
+read_config() {
+    local section="$1"
+    local key="$2"
+    local default="$3"
+    local value=""
+
+    if [[ -f "$CONFIG_FILE" ]]; then
+        # Simple INI parser: find [section], then key = value
+        value=$(awk -F '=' -v section="$section" -v key="$key" '
+            /^\[.*\]$/ { current_section = substr($0, 2, length($0)-2) }
+            current_section == section && $1 ~ "^[[:space:]]*"key"[[:space:]]*$" {
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2)
+                print $2
+                exit
+            }
+        ' "$CONFIG_FILE")
+    fi
+
+    if [[ -n "$value" ]]; then
+        echo "$value"
+    else
+        echo "$default"
+    fi
+}
+
+# Load configuration
+PRIVATE_LABEL=$(read_config "vm" "private_disk_label" "$DEFAULT_PRIVATE_LABEL")
+MIN_UID=$(read_config "guest" "min_uid" "$DEFAULT_MIN_UID")
+HOME_BASE=$(read_config "guest" "home_base" "$DEFAULT_HOME_BASE")
+
+log_action() {
+    local action="$1"
+    local message="$2"
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] [$action] $message" >> "$LOG_FILE" 2>/dev/null || \
+        echo "[$timestamp] [$action] $message" >&2
+}
+
+log_action "START" "appvm-init starting"
+
+# Hostname is set by QEMU hook writing /etc/hostname before boot
+
+# Find private disk by label
+PRIVATE_DISK=$(blkid -L "$PRIVATE_LABEL" 2>/dev/null || true)
+
+if [[ -z "$PRIVATE_DISK" ]]; then
+    log_action "EXIT" "No private disk found (label: $PRIVATE_LABEL) - this is a Disposable VM"
+    exit 0
+fi
+
+log_action "FOUND" "Private disk found at: $PRIVATE_DISK"
+
+# Create mount point if needed
+if [[ ! -d "$MOUNT_POINT" ]]; then
+    log_action "MKDIR" "command: mkdir -p $MOUNT_POINT"
+    mkdir -p "$MOUNT_POINT"
+fi
+
+# Mount private disk
+if ! mountpoint -q "$MOUNT_POINT"; then
+    log_action "MOUNT" "command: mount $PRIVATE_DISK $MOUNT_POINT"
+    mount "$PRIVATE_DISK" "$MOUNT_POINT"
+else
+    log_action "SKIP" "$MOUNT_POINT is already mounted"
+fi
+
+# Check if this is a cold start (empty /rw/home)
+COLD_START=false
+if [[ ! -d "$MOUNT_POINT/home" ]] || [[ -z "$(ls -A "$MOUNT_POINT/home" 2>/dev/null)" ]]; then
+    COLD_START=true
+    log_action "COLD_START" "Detected cold start - initializing private disk"
+fi
+
+if $COLD_START; then
+    # Create directory structure
+    log_action "MKDIR" "command: mkdir -p $MOUNT_POINT/home $MOUNT_POINT/usrlocal"
+    mkdir -p "$MOUNT_POINT/home" "$MOUNT_POINT/usrlocal"
+
+    # Create home directories for users with login shells
+    # By default, copy from user's template home if it exists, else use skel
+    # If /etc/appvm-skel-only exists, always use skel (skip template home)
+    SKEL_ONLY=false
+    if [[ -f /etc/appvm-skel-only ]]; then
+        SKEL_ONLY=true
+        log_action "CONFIG" "skel-only mode enabled (/etc/appvm-skel-only exists)"
+    fi
+
+    log_action "INIT" "Creating home directories from /etc/passwd (min_uid=$MIN_UID, home_base=$HOME_BASE)"
+    while IFS=: read -r username _ uid gid _ home shell; do
+        # Skip system users (UID < MIN_UID) and users without valid home/shell
+        if [[ "$uid" -lt "$MIN_UID" ]]; then
+            continue
+        fi
+        if [[ "$home" != "$HOME_BASE"/* ]]; then
+            continue
+        fi
+        if [[ "$shell" == */nologin ]] || [[ "$shell" == */false ]]; then
+            continue
+        fi
+
+        # Extract just the username part of home path
+        home_name="${home#$HOME_BASE/}"
+
+        if [[ ! -d "$MOUNT_POINT/home/$home_name" ]]; then
+            log_action "CREATE_HOME" "Creating home for $username (uid=$uid)"
+
+            # Create home directory
+            mkdir -p "$MOUNT_POINT/home/$home_name"
+
+            # Copy files: prefer template home, fall back to skel
+            if [[ "$SKEL_ONLY" == false ]] && [[ -d "$home" ]] && [[ -n "$(ls -A "$home" 2>/dev/null)" ]]; then
+                # User has files in template home - copy those
+                log_action "COPY_HOME" "Copying template home for $username from $home"
+                cp -rT "$home" "$MOUNT_POINT/home/$home_name"
+            elif [[ -d /etc/skel ]]; then
+                # Use skeleton files
+                log_action "COPY_SKEL" "Using skel for $username"
+                cp -rT /etc/skel "$MOUNT_POINT/home/$home_name"
+            fi
+
+            # Set ownership
+            chown -R "$uid:$gid" "$MOUNT_POINT/home/$home_name"
+            chmod 700 "$MOUNT_POINT/home/$home_name"
+        fi
+    done < /etc/passwd
+
+    # Populate /usr/local structure
+    # By default, copy from template /usr/local if it has content
+    # If /etc/appvm-fresh-usrlocal exists, create fresh structure instead
+    FRESH_USRLOCAL=false
+    if [[ -f /etc/appvm-fresh-usrlocal ]]; then
+        FRESH_USRLOCAL=true
+        log_action "CONFIG" "fresh-usrlocal mode enabled (/etc/appvm-fresh-usrlocal exists)"
+    fi
+
+    if [[ "$FRESH_USRLOCAL" == false ]] && [[ -d /usr/local ]] && [[ -n "$(ls -A /usr/local 2>/dev/null)" ]]; then
+        # Copy template /usr/local
+        log_action "COPY_USRLOCAL" "Copying template /usr/local to private disk"
+        cp -rT /usr/local "$MOUNT_POINT/usrlocal"
+    else
+        # Create fresh /usr/local structure
+        log_action "INIT" "Creating fresh /usr/local structure"
+        mkdir -p "$MOUNT_POINT/usrlocal"/{bin,sbin,lib,lib64,include,src,share}
+        mkdir -p "$MOUNT_POINT/usrlocal"/share/{man,info,doc}
+        for i in 1 2 3 4 5 6 7 8; do
+            mkdir -p "$MOUNT_POINT/usrlocal/share/man/man$i"
+        done
+    fi
+
+    log_action "INIT_DONE" "Cold start initialization complete"
+fi
+
+# Preserve template directories at /template before overlaying
+# This allows access to original template files even after bind mounts
+mkdir -p /template
+
+# Preserve template home at /template/home (read-only)
+if ! mountpoint -q /template/home; then
+    if [[ -d "$HOME_BASE" ]]; then
+        mkdir -p /template/home
+        log_action "BIND" "command: mount --bind $HOME_BASE /template/home && mount -o remount,ro,bind /template/home"
+        mount --bind "$HOME_BASE" /template/home
+        mount -o remount,ro,bind /template/home
+    fi
+fi
+
+# Preserve template /usr/local at /template/usrlocal (read-only)
+if ! mountpoint -q /template/usrlocal; then
+    if [[ -d /usr/local ]]; then
+        mkdir -p /template/usrlocal
+        log_action "BIND" "command: mount --bind /usr/local /template/usrlocal && mount -o remount,ro,bind /template/usrlocal"
+        mount --bind /usr/local /template/usrlocal
+        mount -o remount,ro,bind /template/usrlocal
+    fi
+fi
+
+# Bind mount /rw/home -> home base
+if ! mountpoint -q "$HOME_BASE"; then
+    log_action "BIND" "command: mount --bind $MOUNT_POINT/home $HOME_BASE"
+    mount --bind "$MOUNT_POINT/home" "$HOME_BASE"
+else
+    log_action "SKIP" "$HOME_BASE is already a mount point"
+fi
+
+# Bind mount /rw/usrlocal -> /usr/local
+if ! mountpoint -q /usr/local; then
+    log_action "BIND" "command: mount --bind $MOUNT_POINT/usrlocal /usr/local"
+    mount --bind "$MOUNT_POINT/usrlocal" /usr/local
+else
+    log_action "SKIP" "/usr/local is already a mount point"
+fi
+
+log_action "DONE" "appvm-init completed successfully"
+exit 0

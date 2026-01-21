@@ -1,0 +1,40 @@
+# kvm-appvm configuration file
+#
+# System-wide config: /etc/appvm/config
+# User config (overrides system): ~/.config/appvm/config
+#
+# Copy this file to one of the above locations and adjust values.
+
+[paths]
+# Template VM disk (qcow2 backing store for all overlay disks)
+template_disk = /VM/kvm/template-root.qcow2
+
+# Directory for VM disk files (overlays and private disks)
+vm_disk_dir = /VM/kvm
+
+# Template VM name in libvirt
+template_vm = template-root
+
+[vm]
+# Size of private disk for work VMs (used by qemu-img create)
+private_disk_size = 20G
+
+# Filesystem label for private disks (used by guest to find the disk)
+private_disk_label = appvm-private
+
+[rdp]
+# RDP connection settings for 'appvm connect'
+username = user
+# password = optional
+
+[network]
+# Network prefix for VM IP detection (via qemu-guest-agent)
+prefix = 192.168.122.
+
+[guest]
+# Minimum UID for creating home directories in work VMs
+# Users with UID below this are considered system users and skipped
+min_uid = 1000
+
+# Home directory base path (users with home outside this are skipped)
+home_base = /home

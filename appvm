@@ -1,0 +1,904 @@
+#!/usr/bin/env python3
+"""kvm-appvm - Manage ephemeral and semi-ephemeral VMs using KVM/libvirt.
+
+Usage:
+    appvm create disp <name>    Create a disposable VM
+    appvm create work <name>    Create a work VM (persistent /home and /usr/local)
+    appvm start <name>          Start a VM
+    appvm stop <name>           Stop a VM (graceful shutdown)
+    appvm connect <name>        Connect to VM via RDP
+    appvm destroy <name>        Remove VM and its disks
+    appvm list                  List all appvm-managed VMs
+    appvm install-guest <qcow2> Install guest scripts into template (offline)
+    appvm update-template       Start template VM for updates (requires permission)
+"""
+
+import configparser
+import os
+import re
+import subprocess
+import sys
+import time
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+# Add lib directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent / "lib"))
+from logger import log, log_command
+
+# Default configuration values
+DEFAULTS = {
+    "paths": {
+        "template_disk": "/VM/kvm/template-root.qcow2",
+        "vm_disk_dir": "/VM/kvm",
+        "template_vm": "template-root",
+    },
+    "vm": {
+        "private_disk_size": "20G",
+        "private_disk_label": "appvm-private",
+    },
+    "rdp": {
+        "username": None,
+        "password": None,
+    },
+    "network": {
+        "prefix": "192.168.122.",
+    },
+    "guest": {
+        "min_uid": "1000",
+        "home_base": "/home",
+    },
+}
+
+# Global config (loaded once)
+_config = None
+
+
+def load_config() -> dict:
+    """Load config from system and user config files.
+
+    Config files are read in order (later overrides earlier):
+    1. /etc/appvm/config (system-wide)
+    2. ~/.config/appvm/config (user-specific)
+    """
+    global _config
+    if _config is not None:
+        return _config
+
+    # Start with defaults
+    config = {section: dict(values) for section, values in DEFAULTS.items()}
+
+    # Config file locations (in priority order, later overrides earlier)
+    config_paths = [
+        Path("/etc/appvm/config"),
+        Path.home() / ".config" / "appvm" / "config",
+    ]
+
+    for config_path in config_paths:
+        if config_path.exists():
+            parser = configparser.ConfigParser()
+            parser.read(config_path)
+            for section in parser.sections():
+                if section not in config:
+                    config[section] = {}
+                for key, value in parser[section].items():
+                    config[section][key] = value
+
+    _config = config
+    return config
+
+
+def ensure_user_config() -> bool:
+    """Ensure user config file exists, create with defaults if not.
+
+    Returns True if config was created (user should be notified).
+    """
+    user_config_dir = Path.home() / ".config" / "appvm"
+    user_config_path = user_config_dir / "config"
+
+    if user_config_path.exists():
+        return False
+
+    # Create directory if needed
+    user_config_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write default config
+    default_config = """# kvm-appvm configuration
+# See config/appvm.conf.example in the source tree for all options.
+
+[paths]
+# Template VM disk (qcow2 backing store for all overlay disks)
+template_disk = /VM/kvm/template-root.qcow2
+
+# Directory for VM disk files (overlays and private disks)
+vm_disk_dir = /VM/kvm
+
+# Template VM name in libvirt
+template_vm = template-root
+
+[vm]
+# Size of private disk for work VMs
+private_disk_size = 20G
+
+# Filesystem label for private disks
+private_disk_label = appvm-private
+
+[rdp]
+# RDP connection settings for 'appvm connect'
+# username = your_username
+# password = optional
+
+[network]
+# Network prefix for VM IP detection
+prefix = 192.168.122.
+
+[guest]
+# Minimum UID for creating home directories in work VMs
+min_uid = 1000
+
+# Home directory base path
+home_base = /home
+"""
+    user_config_path.write_text(default_config)
+    return True
+
+
+def get_template_vm() -> str:
+    """Get template VM name from config."""
+    return load_config()["paths"]["template_vm"]
+
+
+def get_template_disk() -> Path:
+    """Get template disk path from config."""
+    return Path(load_config()["paths"]["template_disk"])
+
+
+def get_vm_disk_dir() -> Path:
+    """Get VM disk directory from config."""
+    return Path(load_config()["paths"]["vm_disk_dir"])
+
+
+def get_private_disk_size() -> str:
+    """Get private disk size from config."""
+    return load_config()["vm"]["private_disk_size"]
+
+
+def get_private_disk_label() -> str:
+    """Get private disk label from config."""
+    return load_config()["vm"]["private_disk_label"]
+
+
+def run_virsh(args: list, capture: bool = True) -> subprocess.CompletedProcess:
+    """Run a virsh command with sudo."""
+    cmd = ["sudo", "virsh"] + args
+    log_command("appvm", "VIRSH", cmd)
+
+    if capture:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+    else:
+        result = subprocess.run(cmd)
+    return result
+
+
+def run_cmd(cmd: list, capture: bool = True) -> subprocess.CompletedProcess:
+    """Run a command."""
+    log_command("appvm", "CMD", cmd)
+
+    if capture:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+    else:
+        result = subprocess.run(cmd)
+    return result
+
+
+def vm_exists(name: str) -> bool:
+    """Check if a VM exists."""
+    result = run_virsh(["dominfo", name])
+    return result.returncode == 0
+
+
+def vm_is_running(name: str) -> bool:
+    """Check if a VM is running."""
+    result = run_virsh(["domstate", name])
+    if result.returncode != 0:
+        return False
+    return "running" in result.stdout.lower()
+
+
+def get_vm_ip(name: str, net_prefix: str) -> str:
+    """Get VM IP address via qemu-guest-agent."""
+    result = run_virsh(["domifaddr", name, "--source", "agent"])
+    if result.returncode != 0:
+        return None
+    # Parse IP from output (format: "vnet0 52:54:00:xx:xx:xx ipv4 192.168.122.x/24")
+    for line in result.stdout.strip().split("\n"):
+        if "ipv4" in line:
+            parts = line.split()
+            for part in parts:
+                if "/" in part:
+                    ip = part.split("/")[0]
+                    if ip.startswith(net_prefix):
+                        return ip
+    return None
+
+
+def get_template_xml() -> str:
+    """Get the template VM's XML definition."""
+    template_vm = get_template_vm()
+    result = run_virsh(["dumpxml", template_vm])
+    if result.returncode != 0:
+        print(f"Error: Cannot get template VM XML: {result.stderr}")
+        sys.exit(1)
+    return result.stdout
+
+
+def modify_xml_for_clone(xml_str: str, new_name: str, disk_path: Path,
+                          private_disk_path: Path = None) -> str:
+    """Modify template XML for a new VM clone."""
+    root = ET.fromstring(xml_str)
+
+    # Change VM name
+    name_elem = root.find("name")
+    if name_elem is not None:
+        name_elem.text = new_name
+
+    # Remove UUID so libvirt generates a new one
+    uuid_elem = root.find("uuid")
+    if uuid_elem is not None:
+        root.remove(uuid_elem)
+
+    # Update disk path for the system disk (first disk)
+    devices = root.find("devices")
+    if devices is not None:
+        disks = devices.findall("disk")
+        for i, disk in enumerate(disks):
+            if disk.get("device") == "disk":
+                source = disk.find("source")
+                if source is not None and i == 0:
+                    # Update system disk path
+                    source.set("file", str(disk_path))
+                    break
+
+        # Add private disk for work VMs
+        if private_disk_path is not None:
+            # Find the target device letter for the new disk
+            existing_targets = []
+            for disk in disks:
+                target = disk.find("target")
+                if target is not None:
+                    existing_targets.append(target.get("dev", ""))
+
+            # Find next available device (vda, vdb, vdc, etc.)
+            for letter in "bcdefghij":
+                new_dev = f"vd{letter}"
+                if new_dev not in existing_targets:
+                    break
+
+            # Create new disk element for private disk
+            private_disk = ET.SubElement(devices, "disk")
+            private_disk.set("type", "file")
+            private_disk.set("device", "disk")
+
+            driver = ET.SubElement(private_disk, "driver")
+            driver.set("name", "qemu")
+            driver.set("type", "qcow2")
+
+            source = ET.SubElement(private_disk, "source")
+            source.set("file", str(private_disk_path))
+
+            target = ET.SubElement(private_disk, "target")
+            target.set("dev", new_dev)
+            target.set("bus", "virtio")
+
+    # Remove MAC addresses so libvirt generates new ones
+    for interface in root.findall(".//interface"):
+        mac = interface.find("mac")
+        if mac is not None:
+            interface.remove(mac)
+
+    # Set SMBIOS product name to VM name (for hostname detection in guest)
+    # Remove existing sysinfo if present
+    for sysinfo in root.findall("sysinfo"):
+        root.remove(sysinfo)
+
+    # Add new sysinfo with product name
+    sysinfo = ET.SubElement(root, "sysinfo")
+    sysinfo.set("type", "smbios")
+    system = ET.SubElement(sysinfo, "system")
+    product = ET.SubElement(system, "entry")
+    product.set("name", "product")
+    product.text = new_name
+
+    # Configure OS to use sysinfo for SMBIOS
+    os_elem = root.find("os")
+    if os_elem is not None:
+        # Remove existing smbios element if present
+        for smbios in os_elem.findall("smbios"):
+            os_elem.remove(smbios)
+        smbios = ET.SubElement(os_elem, "smbios")
+        smbios.set("mode", "sysinfo")
+
+    return ET.tostring(root, encoding="unicode")
+
+
+def find_free_nbd_device() -> str:
+    """Find a free /dev/nbd* device."""
+    for i in range(16):
+        nbd = f"/dev/nbd{i}"
+        # Check if device exists
+        if not os.path.exists(nbd):
+            continue
+        # Check if device is in use by looking at its size
+        result = subprocess.run(
+            ["sudo", "blockdev", "--getsize64", nbd],
+            capture_output=True, text=True
+        )
+        # If size is 0, device is not connected to anything
+        if result.returncode == 0 and result.stdout.strip() == "0":
+            return nbd
+    return None
+
+
+def create_private_disk(disk_path: Path, size: str = None) -> bool:
+    """Create a private disk with the appvm-private label."""
+    if size is None:
+        size = get_private_disk_size()
+    label = get_private_disk_label()
+
+    # Create qcow2 disk
+    result = run_cmd(["sudo", "qemu-img", "create", "-f", "qcow2",
+                      str(disk_path), size])
+    if result.returncode != 0:
+        print(f"Error creating private disk: {result.stderr}")
+        return False
+
+    # Load nbd module if needed
+    result = run_cmd(["sudo", "modprobe", "nbd", "max_part=8"])
+    if result.returncode != 0:
+        print(f"Error loading nbd module: {result.stderr}")
+        return False
+    time.sleep(0.5)  # Wait for devices to appear
+
+    # Find a free nbd device
+    nbd_dev = find_free_nbd_device()
+    if not nbd_dev:
+        print("Error: No free nbd device found")
+        return False
+
+    log("appvm", "NBD", command=f"using {nbd_dev} for {disk_path}")
+
+    try:
+        # Connect qcow2 to nbd device
+        result = run_cmd(["sudo", "qemu-nbd", "-c", nbd_dev, str(disk_path)])
+        if result.returncode != 0:
+            print(f"Error connecting nbd: {result.stderr}")
+            return False
+
+        # Create partition table and partition
+        result = run_cmd(["sudo", "parted", "-s", nbd_dev, "mklabel", "msdos"])
+        if result.returncode != 0:
+            print(f"Error creating partition table: {result.stderr}")
+            return False
+
+        result = run_cmd(["sudo", "parted", "-s", nbd_dev, "mkpart", "primary", "ext4", "1MiB", "100%"])
+        if result.returncode != 0:
+            print(f"Error creating partition: {result.stderr}")
+            return False
+
+        # Wait for partition to appear
+        time.sleep(0.5)
+
+        # Format with ext4 and set label
+        partition = f"{nbd_dev}p1"
+        result = run_cmd(["sudo", "mkfs.ext4", "-L", label, partition])
+        if result.returncode != 0:
+            print(f"Error formatting partition: {result.stderr}")
+            return False
+
+        log("appvm", "FORMAT", command=f"mkfs.ext4 -L {label} {partition}")
+        return True
+
+    finally:
+        # Always disconnect nbd device
+        run_cmd(["sudo", "qemu-nbd", "-d", nbd_dev])
+
+
+def create_disp_vm(name: str) -> bool:
+    """Create a disposable VM."""
+    vm_name = f"disp-vm-{name}"
+    disk_path = get_vm_disk_dir() / f"{vm_name}.qcow2"
+
+    log("appvm", "CREATE_DISP", message=f"Creating disposable VM: {vm_name}")
+
+    if vm_exists(vm_name):
+        print(f"Error: VM '{vm_name}' already exists")
+        return False
+
+    # Get and modify template XML
+    template_xml = get_template_xml()
+    new_xml = modify_xml_for_clone(template_xml, vm_name, disk_path)
+
+    # Define the new VM
+    result = subprocess.run(
+        ["sudo", "virsh", "define", "/dev/stdin"],
+        input=new_xml,
+        capture_output=True,
+        text=True
+    )
+    log("appvm", "DEFINE", command=f"virsh define (stdin) for {vm_name}")
+
+    if result.returncode != 0:
+        print(f"Error defining VM: {result.stderr}")
+        return False
+
+    print(f"Created disposable VM: {vm_name}")
+    print(f"  System disk will be created at: {disk_path}")
+    print(f"  (Overlay is created automatically on VM start by QEMU hook)")
+    return True
+
+
+def create_work_vm(name: str) -> bool:
+    """Create a work VM with persistent private disk."""
+    vm_disk_dir = get_vm_disk_dir()
+    sys_name = f"work-sys-{name}"
+    priv_name = f"work-priv-{name}"
+    sys_disk_path = vm_disk_dir / f"{sys_name}.qcow2"
+    priv_disk_path = vm_disk_dir / f"{priv_name}.qcow2"
+
+    log("appvm", "CREATE_WORK", message=f"Creating work VM: {sys_name}")
+
+    if vm_exists(sys_name):
+        print(f"Error: VM '{sys_name}' already exists")
+        return False
+
+    # Create private disk first
+    print(f"Creating private disk: {priv_disk_path}")
+    if not create_private_disk(priv_disk_path):
+        return False
+
+    # Get and modify template XML (include private disk)
+    template_xml = get_template_xml()
+    new_xml = modify_xml_for_clone(template_xml, sys_name, sys_disk_path,
+                                    priv_disk_path)
+
+    # Define the new VM
+    result = subprocess.run(
+        ["sudo", "virsh", "define", "/dev/stdin"],
+        input=new_xml,
+        capture_output=True,
+        text=True
+    )
+    log("appvm", "DEFINE", command=f"virsh define (stdin) for {sys_name}")
+
+    if result.returncode != 0:
+        print(f"Error defining VM: {result.stderr}")
+        # Clean up private disk on failure
+        if priv_disk_path.exists():
+            run_cmd(["sudo", "rm", "-f", str(priv_disk_path)])
+        return False
+
+    print(f"Created work VM: {sys_name}")
+    print(f"  System disk will be created at: {sys_disk_path}")
+    print(f"  Private disk created at: {priv_disk_path}")
+    print(f"  (System disk overlay is created automatically on VM start)")
+    return True
+
+
+def start_vm(name: str) -> bool:
+    """Start a VM."""
+    log("appvm", "START", message=f"Starting VM: {name}")
+
+    if not vm_exists(name):
+        print(f"Error: VM '{name}' does not exist")
+        return False
+
+    if vm_is_running(name):
+        print(f"VM '{name}' is already running")
+        return True
+
+    result = run_virsh(["start", name])
+    if result.returncode != 0:
+        print(f"Error starting VM: {result.stderr}")
+        return False
+
+    print(f"Started VM: {name}")
+    return True
+
+
+def stop_vm(name: str) -> bool:
+    """Stop a VM gracefully."""
+    log("appvm", "STOP", message=f"Stopping VM: {name}")
+
+    if not vm_exists(name):
+        print(f"Error: VM '{name}' does not exist")
+        return False
+
+    if not vm_is_running(name):
+        print(f"VM '{name}' is not running")
+        return True
+
+    result = run_virsh(["shutdown", name])
+    if result.returncode != 0:
+        print(f"Error stopping VM: {result.stderr}")
+        return False
+
+    print(f"Shutdown signal sent to VM: {name}")
+    return True
+
+
+def destroy_vm(name: str) -> bool:
+    """Destroy a VM and remove its disks."""
+    log("appvm", "DESTROY", message=f"Destroying VM: {name}")
+    vm_disk_dir = get_vm_disk_dir()
+
+    # Determine VM type and disk paths
+    if name.startswith("disp-vm-"):
+        sys_disk = vm_disk_dir / f"{name}.qcow2"
+        priv_disk = None
+    elif name.startswith("work-sys-"):
+        sys_disk = vm_disk_dir / f"{name}.qcow2"
+        base_name = name.replace("work-sys-", "")
+        priv_disk = vm_disk_dir / f"work-priv-{base_name}.qcow2"
+    else:
+        print(f"Error: '{name}' is not a managed VM (must start with disp-vm- or work-sys-)")
+        return False
+
+    if not vm_exists(name):
+        print(f"Error: VM '{name}' does not exist")
+        return False
+
+    # Stop VM if running
+    if vm_is_running(name):
+        print(f"Stopping running VM: {name}")
+        run_virsh(["destroy", name])  # Force stop
+
+    # Undefine the VM
+    result = run_virsh(["undefine", name])
+    if result.returncode != 0:
+        print(f"Error undefining VM: {result.stderr}")
+        return False
+
+    # Remove system disk
+    if sys_disk.exists():
+        run_cmd(["sudo", "rm", "-f", str(sys_disk)])
+        print(f"Removed system disk: {sys_disk}")
+
+    # Remove private disk for work VMs
+    if priv_disk is not None and priv_disk.exists():
+        run_cmd(["sudo", "rm", "-f", str(priv_disk)])
+        print(f"Removed private disk: {priv_disk}")
+
+    print(f"Destroyed VM: {name}")
+    return True
+
+
+def list_vms() -> bool:
+    """List all appvm-managed VMs."""
+    log("appvm", "LIST", message="Listing managed VMs")
+
+    result = run_virsh(["list", "--all"])
+    if result.returncode != 0:
+        print(f"Error listing VMs: {result.stderr}")
+        return False
+
+    # Parse virsh output and filter managed VMs
+    lines = result.stdout.strip().split("\n")
+
+    managed_vms = []
+    for line in lines[2:]:  # Skip header lines
+        if not line.strip():
+            continue
+        parts = line.split()
+        if len(parts) >= 2:
+            vm_name = parts[1]
+            if vm_name.startswith("disp-vm-") or vm_name.startswith("work-sys-"):
+                state = " ".join(parts[2:]) if len(parts) > 2 else "unknown"
+                vm_type = "disposable" if vm_name.startswith("disp-vm-") else "work"
+                managed_vms.append((vm_name, vm_type, state))
+
+    if not managed_vms:
+        print("No managed VMs found")
+        return True
+
+    print(f"{'NAME':<30} {'TYPE':<12} {'STATE':<15}")
+    print("-" * 60)
+    for vm_name, vm_type, state in managed_vms:
+        print(f"{vm_name:<30} {vm_type:<12} {state:<15}")
+
+    return True
+
+
+def update_template() -> bool:
+    """Start template VM for updates (requires explicit permission)."""
+    template_vm = get_template_vm()
+    template_disk = get_template_disk()
+
+    print("WARNING: This will start the template VM for updates.")
+    print("The template disk at:")
+    print(f"  {template_disk}")
+    print("will be modified directly.")
+    print()
+
+    response = input("Do you have explicit permission to modify the template? [y/N]: ")
+    if response.lower() != "y":
+        print("Aborted.")
+        return False
+
+    log("appvm", "UPDATE_TEMPLATE", message="Starting template VM for updates (user confirmed)")
+
+    if vm_is_running(template_vm):
+        print(f"Template VM '{template_vm}' is already running")
+        return True
+
+    result = run_virsh(["start", template_vm])
+    if result.returncode != 0:
+        print(f"Error starting template VM: {result.stderr}")
+        return False
+
+    print(f"Started template VM: {template_vm}")
+    print("Remember to shut down the template VM when updates are complete.")
+    return True
+
+
+def connect_vm(name: str) -> bool:
+    """Connect to VM via RDP using Remmina."""
+    log("appvm", "CONNECT", message=f"Connecting to VM: {name}")
+
+    if not vm_exists(name):
+        print(f"Error: VM '{name}' does not exist")
+        return False
+
+    if not vm_is_running(name):
+        print(f"Error: VM '{name}' is not running")
+        return False
+
+    # Load config
+    config = load_config()
+    net_prefix = config["network"]["prefix"]
+
+    # Get VM IP
+    ip = get_vm_ip(name, net_prefix)
+    if not ip:
+        print(f"Error: Could not get IP for VM '{name}'")
+        print(f"Looking for IP starting with: {net_prefix}")
+        print("Ensure qemu-guest-agent is running in the VM")
+        return False
+
+    username = config["rdp"].get("username")
+    password = config["rdp"].get("password")
+
+    # Create temporary Remmina connection file
+    remmina_dir = Path.home() / ".local" / "share" / "remmina"
+    remmina_dir.mkdir(parents=True, exist_ok=True)
+    remmina_file = remmina_dir / f"appvm-{name}.remmina"
+
+    remmina_config = [
+        "[remmina]",
+        "name=" + name,
+        "protocol=RDP",
+        "server=" + ip,
+        "cert_ignore=1",
+        "security=",
+    ]
+    if username:
+        remmina_config.append("username=" + username)
+    if password:
+        remmina_config.append("password=" + password)
+
+    remmina_file.write_text("\n".join(remmina_config) + "\n")
+
+    print(f"Connecting to {name} at {ip}...")
+    subprocess.Popen(["remmina", "-c", str(remmina_file)],
+                     stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL)
+    return True
+
+
+def install_guest(template_disk: Path) -> bool:
+    """Install guest scripts into template via qemu-nbd."""
+    log("appvm", "INSTALL_GUEST", message=f"Installing guest scripts into {template_disk}")
+
+    if not template_disk.exists():
+        print(f"Error: Template disk not found: {template_disk}")
+        return False
+
+    # Get paths to guest scripts
+    script_dir = Path(__file__).parent
+    init_script = script_dir / "guest" / "appvm-init"
+    service_file = script_dir / "guest" / "appvm-init.service"
+
+    if not init_script.exists():
+        print(f"Error: Guest init script not found: {init_script}")
+        return False
+    if not service_file.exists():
+        print(f"Error: Guest service file not found: {service_file}")
+        return False
+
+    # Load nbd module
+    result = run_cmd(["sudo", "modprobe", "nbd", "max_part=8"])
+    if result.returncode != 0:
+        print(f"Error loading nbd module: {result.stderr}")
+        return False
+    time.sleep(0.5)
+
+    # Find a free nbd device
+    nbd_dev = find_free_nbd_device()
+    if not nbd_dev:
+        print("Error: No free nbd device found")
+        return False
+
+    mount_point = Path("/tmp/appvm-template-mount")
+
+    try:
+        # Connect template disk to nbd
+        print(f"Connecting {template_disk} to {nbd_dev}...")
+        result = run_cmd(["sudo", "qemu-nbd", "-c", nbd_dev, str(template_disk)])
+        if result.returncode != 0:
+            print(f"Error connecting nbd: {result.stderr}")
+            return False
+
+        time.sleep(0.5)
+
+        # Find the root partition (usually p1 or just the device for unpartitioned)
+        # Try common partition schemes
+        root_part = None
+        for part in [f"{nbd_dev}p1", f"{nbd_dev}p2", nbd_dev]:
+            result = run_cmd(["sudo", "blkid", part])
+            if result.returncode == 0 and "TYPE=" in result.stdout:
+                root_part = part
+                break
+
+        if not root_part:
+            print("Error: Could not find root partition on template disk")
+            return False
+
+        print(f"Found root partition: {root_part}")
+
+        # Create mount point and mount
+        run_cmd(["sudo", "mkdir", "-p", str(mount_point)])
+        result = run_cmd(["sudo", "mount", root_part, str(mount_point)])
+        if result.returncode != 0:
+            print(f"Error mounting: {result.stderr}")
+            return False
+
+        print(f"Mounted at {mount_point}")
+
+        # Install appvm-init script
+        dest_init = mount_point / "usr/local/bin/appvm-init"
+        run_cmd(["sudo", "mkdir", "-p", str(dest_init.parent)])
+        result = run_cmd(["sudo", "cp", str(init_script), str(dest_init)])
+        if result.returncode != 0:
+            print(f"Error copying init script: {result.stderr}")
+            return False
+        run_cmd(["sudo", "chmod", "+x", str(dest_init)])
+        print(f"Installed: {dest_init}")
+
+        # Install systemd service
+        dest_service = mount_point / "etc/systemd/system/appvm-init.service"
+        result = run_cmd(["sudo", "cp", str(service_file), str(dest_service)])
+        if result.returncode != 0:
+            print(f"Error copying service file: {result.stderr}")
+            return False
+        print(f"Installed: {dest_service}")
+
+        # Enable the service by creating symlink
+        wants_dir = mount_point / "etc/systemd/system/sysinit.target.wants"
+        run_cmd(["sudo", "mkdir", "-p", str(wants_dir)])
+        symlink_path = wants_dir / "appvm-init.service"
+        run_cmd(["sudo", "rm", "-f", str(symlink_path)])
+        result = run_cmd(["sudo", "ln", "-s",
+                         "/etc/systemd/system/appvm-init.service",
+                         str(symlink_path)])
+        if result.returncode != 0:
+            print(f"Error enabling service: {result.stderr}")
+            return False
+        print(f"Enabled service: {symlink_path}")
+
+        print("\nGuest scripts installed successfully!")
+        return True
+
+    finally:
+        # Cleanup: unmount and disconnect
+        run_cmd(["sudo", "umount", str(mount_point)])
+        run_cmd(["sudo", "rmdir", str(mount_point)])
+        run_cmd(["sudo", "qemu-nbd", "-d", nbd_dev])
+        print(f"Disconnected {nbd_dev}")
+
+
+def print_usage():
+    """Print usage information."""
+    print(__doc__)
+
+
+def main():
+    # Ensure user config exists, notify if just created
+    if ensure_user_config():
+        user_config = Path.home() / ".config" / "appvm" / "config"
+        print(f"Created default config at: {user_config}")
+        print("Please review and adjust settings (template paths, RDP username, etc.)")
+        print()
+
+    if len(sys.argv) < 2:
+        print_usage()
+        sys.exit(1)
+
+    command = sys.argv[1]
+
+    if command == "create":
+        if len(sys.argv) < 4:
+            print("Usage: appvm create <disp|work> <name>")
+            sys.exit(1)
+        vm_type = sys.argv[2]
+        name = sys.argv[3]
+
+        # Validate name (alphanumeric and hyphens only)
+        if not re.match(r'^[a-zA-Z0-9-]+$', name):
+            print("Error: VM name must contain only letters, numbers, and hyphens")
+            sys.exit(1)
+
+        if vm_type == "disp":
+            success = create_disp_vm(name)
+        elif vm_type == "work":
+            success = create_work_vm(name)
+        else:
+            print(f"Error: Unknown VM type '{vm_type}'. Use 'disp' or 'work'")
+            sys.exit(1)
+
+        sys.exit(0 if success else 1)
+
+    elif command == "start":
+        if len(sys.argv) < 3:
+            print("Usage: appvm start <name>")
+            sys.exit(1)
+        success = start_vm(sys.argv[2])
+        sys.exit(0 if success else 1)
+
+    elif command == "stop":
+        if len(sys.argv) < 3:
+            print("Usage: appvm stop <name>")
+            sys.exit(1)
+        success = stop_vm(sys.argv[2])
+        sys.exit(0 if success else 1)
+
+    elif command == "connect":
+        if len(sys.argv) < 3:
+            print("Usage: appvm connect <name>")
+            sys.exit(1)
+        success = connect_vm(sys.argv[2])
+        sys.exit(0 if success else 1)
+
+    elif command == "destroy":
+        if len(sys.argv) < 3:
+            print("Usage: appvm destroy <name>")
+            sys.exit(1)
+        success = destroy_vm(sys.argv[2])
+        sys.exit(0 if success else 1)
+
+    elif command == "list":
+        success = list_vms()
+        sys.exit(0 if success else 1)
+
+    elif command == "update-template":
+        success = update_template()
+        sys.exit(0 if success else 1)
+
+    elif command == "install-guest":
+        if len(sys.argv) < 3:
+            print("Usage: appvm install-guest <template.qcow2>")
+            sys.exit(1)
+        template_path = Path(sys.argv[2])
+        success = install_guest(template_path)
+        sys.exit(0 if success else 1)
+
+    elif command in ["-h", "--help", "help"]:
+        print_usage()
+        sys.exit(0)
+
+    else:
+        print(f"Error: Unknown command '{command}'")
+        print_usage()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

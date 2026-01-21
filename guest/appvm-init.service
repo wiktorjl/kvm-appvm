@@ -1,0 +1,17 @@
+[Unit]
+Description=kvm-appvm Work VM Initialization
+DefaultDependencies=no
+After=local-fs.target
+Before=systemd-user-sessions.service
+Before=network.target
+ConditionPathExists=/usr/local/bin/appvm-init
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/appvm-init
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=sysinit.target

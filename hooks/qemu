@@ -1,0 +1,169 @@
+#!/bin/bash
+# QEMU hook for kvm-appvm
+#
+# Handles automatic overlay disk creation on VM start for:
+# - disp-vm-* (Disposable VMs)
+# - work-sys-* (Work VMs - system disk only)
+# - template-root (Template VM)
+#
+# Symlink this to /etc/libvirt/hooks/qemu
+
+set -e
+
+# Configuration defaults
+DEFAULT_TEMPLATE_DISK="/VM/kvm/template-root.qcow2"
+DEFAULT_VM_DISK_DIR="/VM/kvm"
+LOG_DIR="/var/log/kvm-appvm"
+LOG_FILE="$LOG_DIR/qemu-hook.log"
+CONFIG_FILE="/etc/appvm/config"
+
+# Ensure log directory exists
+mkdir -p "$LOG_DIR" 2>/dev/null || true
+
+# Read value from INI config file
+# Usage: read_config <section> <key> <default>
+read_config() {
+    local section="$1"
+    local key="$2"
+    local default="$3"
+    local value=""
+
+    if [[ -f "$CONFIG_FILE" ]]; then
+        # Simple INI parser: find [section], then key = value
+        value=$(awk -F '=' -v section="$section" -v key="$key" '
+            /^\[.*\]$/ { current_section = substr($0, 2, length($0)-2) }
+            current_section == section && $1 ~ "^[[:space:]]*"key"[[:space:]]*$" {
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2)
+                print $2
+                exit
+            }
+        ' "$CONFIG_FILE")
+    fi
+
+    if [[ -n "$value" ]]; then
+        echo "$value"
+    else
+        echo "$default"
+    fi
+}
+
+# Load configuration
+TEMPLATE_DISK=$(read_config "paths" "template_disk" "$DEFAULT_TEMPLATE_DISK")
+VM_DISK_DIR=$(read_config "paths" "vm_disk_dir" "$DEFAULT_VM_DISK_DIR")
+
+log_action() {
+    local action="$1"
+    local message="$2"
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] [$action] $message" >> "$LOG_FILE" 2>/dev/null || \
+        echo "[$timestamp] [$action] $message" >&2
+}
+
+# Hook arguments
+VM_NAME="$1"
+ACTION="$2"
+SUB_ACTION="$3"
+
+log_action "HOOK" "VM=$VM_NAME ACTION=$ACTION SUB_ACTION=$SUB_ACTION"
+
+# Only handle prepare action (called before VM starts)
+if [[ "$ACTION" != "prepare" ]]; then
+    exit 0
+fi
+
+# Check if this is a VM we manage
+case "$VM_NAME" in
+    disp-vm-*|work-sys-*)
+        ;;
+    *)
+        log_action "SKIP" "VM $VM_NAME is not managed by kvm-appvm"
+        exit 0
+        ;;
+esac
+
+# Define overlay disk path
+OVERLAY_DISK="$VM_DISK_DIR/${VM_NAME}.qcow2"
+
+# Remove old overlay if it exists
+if [[ -f "$OVERLAY_DISK" ]]; then
+    log_action "REMOVE" "command: rm -f $OVERLAY_DISK"
+    rm -f "$OVERLAY_DISK"
+fi
+
+# Create new overlay with template as backing store
+log_action "CREATE" "command: qemu-img create -f qcow2 -F qcow2 -b $TEMPLATE_DISK $OVERLAY_DISK"
+qemu-img create -f qcow2 -F qcow2 -b "$TEMPLATE_DISK" "$OVERLAY_DISK"
+
+# Set hostname in the overlay
+set_hostname() {
+    local overlay="$1"
+    local hostname="$2"
+
+    # Load nbd module
+    modprobe nbd max_part=8 2>/dev/null || true
+    sleep 0.3
+
+    # Find free nbd device
+    local nbd_dev=""
+    for i in $(seq 0 15); do
+        if [[ -e "/dev/nbd$i" ]]; then
+            local size
+            size=$(blockdev --getsize64 "/dev/nbd$i" 2>/dev/null || echo "0")
+            if [[ "$size" == "0" ]]; then
+                nbd_dev="/dev/nbd$i"
+                break
+            fi
+        fi
+    done
+
+    if [[ -z "$nbd_dev" ]]; then
+        log_action "WARN" "No free nbd device found, skipping hostname setup"
+        return 1
+    fi
+
+    log_action "NBD" "Using $nbd_dev for hostname setup"
+
+    # Connect overlay to nbd
+    qemu-nbd -c "$nbd_dev" "$overlay"
+    sleep 0.3
+
+    # Find and mount root partition
+    local mount_point="/tmp/appvm-overlay-$$"
+    mkdir -p "$mount_point"
+
+    local mounted=false
+    for part in "${nbd_dev}p1" "${nbd_dev}p2" "$nbd_dev"; do
+        if mount "$part" "$mount_point" 2>/dev/null; then
+            mounted=true
+            log_action "MOUNT" "Mounted $part at $mount_point"
+            break
+        fi
+    done
+
+    if $mounted; then
+        # Write hostname
+        echo "$hostname" > "$mount_point/etc/hostname"
+        log_action "HOSTNAME" "Set hostname to: $hostname"
+
+        # Unmount
+        umount "$mount_point"
+    else
+        log_action "WARN" "Could not mount overlay, skipping hostname setup"
+    fi
+
+    # Cleanup
+    rmdir "$mount_point" 2>/dev/null || true
+    qemu-nbd -d "$nbd_dev"
+
+    return 0
+}
+
+set_hostname "$OVERLAY_DISK" "$VM_NAME"
+
+# Set appropriate permissions
+chmod 644 "$OVERLAY_DISK"
+
+log_action "DONE" "Created overlay $OVERLAY_DISK for $VM_NAME"
+
+exit 0

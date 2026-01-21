@@ -10,6 +10,12 @@ Additional features:
 1. Sets the hostname to match the VM name
 2. Connects to the VM via RDP
 
+## Key Innovations
+
+1. Auto-reset overlay on VM start via Qemu hook
+2. Concept of an "app" VM (ephemeral root + persistent /home)
+3. Cold-start detection, triggering guest setup
+   
 ## Templates
 
 Both types of VMs are created from a template you provide. For now, the template is assumed to be a Debian 12-13 installation. To update the template, launch it with `appvm update-template`, run your updates, then shut down. 

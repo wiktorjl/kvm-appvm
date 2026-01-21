@@ -13,7 +13,32 @@ Additional features:
 ## Templates
 
 Both types of VMs are created from a template you provide. For now, the template is assumed to be a Debian 12-13 installation. To update the template, launch it with `appvm update-template`, run your updates, then shut down. 
-
+```
+                                 _________________ 
+                                |                 |
+                                |  DISPOSABLE VM  |
+                                |                 |
+                                |  Fully          |
+                                |  Ephemeral      |
+  _________________             |  VM - resets    |
+ |                 |            |  at boot time   |
+ |   TEMPLATE VM   |  overlay   |                 |
+ |                 |===========>|                 |
+ |   This is where |            |                 |
+ |   you curate    |            |_________________|
+ |   your base     |
+ |   installation  |             _________________                   _________________
+ |                 |  overlay   |                 |                 |                 |
+ |                 |===========>|     APP VM      |                 |  PRIVATE EXT4   |
+ |                 |            |                 |                 |                 |
+ |_________________|            |     /home ------+--(bind mount)-->|  /rw/home       |
+                                |     /usr/local -+--(bind mount)-->|  /rw/usrlocal   |
+                                |                 |                 |                 |
+                                |  Disposable VM  |                 |  Private drive  |
+                                |  with private   |                 |  per AppVM      |
+                                |  disk space     |                 |                 |
+                                |_________________|                 |_________________|
+```                                
 ## Installation
 
 ```bash

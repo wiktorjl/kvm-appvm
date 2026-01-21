@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+.env
+*.egg-info/
+dist/
+build/
+.eggs/
+pip-log.txt
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Bash/Shell
+*.log
+*.tmp
+*.bak
+*.swp
+*~
+
+# IDE/Editors
+.vscode/
+.idea/
+*.sublime-*
+.project
+.pydevproject
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project-specific
+*.local
+.secrets

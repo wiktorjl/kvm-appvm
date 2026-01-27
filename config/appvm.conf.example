@@ -38,3 +38,12 @@ min_uid = 1000
 
 # Home directory base path (users with home outside this are skipped)
 home_base = /home
+
+[sshfs]
+# Settings for mount_vm_drives.sh
+
+# Local directory where VM home directories are mounted
+mount_dir = ~/mounts
+
+# SSH username on guest VMs (defaults to rdp.username if not set)
+# remote_user = user

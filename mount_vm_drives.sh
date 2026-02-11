@@ -7,7 +7,7 @@
 set -e
 
 # Configuration defaults
-DEFAULT_MOUNT_DIR="$HOME/mounts"
+DEFAULT_MOUNT_DIR="/mnt/vm"
 DEFAULT_NET_PREFIX="192.168.122."
 LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/appvm"
 LOG_FILE="$LOG_DIR/appvm.log"
@@ -106,7 +106,7 @@ Configuration:
   Add to /etc/appvm/config or ~/.config/appvm/config:
 
   [sshfs]
-  mount_dir = ~/mounts                  # Local mount directory
+  mount_dir = /mnt/vm                   # Local mount directory
   # remote_user = user                  # Defaults to rdp.username
 
 EOF

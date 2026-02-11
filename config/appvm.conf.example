@@ -43,7 +43,7 @@ home_base = /home
 # Settings for mount_vm_drives.sh
 
 # Local directory where VM home directories are mounted
-mount_dir = ~/mounts
+mount_dir = /mnt/vm
 
 # SSH username on guest VMs (defaults to rdp.username if not set)
 # remote_user = user

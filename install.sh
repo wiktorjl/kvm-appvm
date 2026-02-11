@@ -70,7 +70,7 @@ fi
 
 echo "=== Host Installation Complete ==="
 echo
-echo "The appvm CLI is ready to use from: $SCRIPT_DIR/appvm"
+echo "The appvm command is ready to use from: $SCRIPT_DIR/appvm"
 echo "You may want to add it to your PATH or create a symlink:"
 echo "  sudo ln -s $SCRIPT_DIR/appvm /usr/local/bin/appvm"
 echo

@@ -2,15 +2,25 @@
 """kvm-appvm - Manage ephemeral and semi-ephemeral VMs using KVM/libvirt.
 
 Usage:
-    appvm create disp <name>    Create a disposable VM
-    appvm create work <name>    Create a work VM (persistent /home and /usr/local)
+    appvm create disp <name> [-s|--start] [-c|--connect] [--ssh]
+                                Create a disposable VM
+                                -s: also start it
+                                -c: also start, wait for guest agent, open RDP
+                                --ssh: also start, wait for guest agent, open SSH
+    appvm create work <name> [-s|--start] [-c|--connect] [--ssh]
+                                Create a work VM (persistent /home and /usr/local)
     appvm start <name>          Start a VM
     appvm stop <name>           Stop a VM (graceful shutdown)
-    appvm connect <name>        Connect to VM via RDP
+    appvm connect <name>        Connect to VM via RDP (auto-starts and waits if needed)
+    appvm ssh <name>            SSH into VM (auto-starts and waits if needed)
     appvm destroy <name>        Remove VM and its disks
     appvm list                  List all appvm-managed VMs
     appvm install-guest <qcow2> Install guest scripts into template (offline)
     appvm update-template       Start template VM for updates (requires permission)
+
+For start/stop/connect/ssh/destroy, <name> accepts either the full libvirt name
+(e.g. disp-vm-foo) or the short form (e.g. foo). If both disp-vm-foo and
+work-sys-foo exist, the full name is required.
 """
 
 import configparser
@@ -43,6 +53,7 @@ DEFAULTS = {
     },
     "network": {
         "prefix": "192.168.122.",
+        "connect_timeout": "60",
     },
     "guest": {
         "min_uid": "1000",
@@ -132,6 +143,9 @@ private_disk_label = appvm-private
 # Network prefix for VM IP detection
 prefix = 192.168.122.
 
+# Seconds to wait for a VM's guest agent to report an IP after starting
+connect_timeout = 60
+
 [guest]
 # Minimum UID for creating home directories in work VMs
 min_uid = 1000
@@ -220,6 +234,51 @@ def get_vm_ip(name: str, net_prefix: str) -> str:
                     if ip.startswith(net_prefix):
                         return ip
     return None
+
+
+def wait_for_vm_ip(name: str, net_prefix: str, timeout: int) -> str:
+    """Poll the guest agent until an IP in net_prefix is reported, or timeout."""
+    log("appvm", "WAIT_IP",
+        message=f"Waiting up to {timeout}s for {name} to report IP via guest agent")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        ip = get_vm_ip(name, net_prefix)
+        if ip:
+            return ip
+        time.sleep(2)
+    return None
+
+
+def resolve_vm_name(name: str) -> str:
+    """Resolve a possibly-short VM name to its full libvirt name.
+
+    If the name already starts with 'disp-vm-' or 'work-sys-', it is checked
+    for existence and returned. Otherwise we look up 'disp-vm-<name>' and
+    'work-sys-<name>': exactly one match is returned, two matches are an
+    ambiguity error, zero matches is a not-found error. Exits the process
+    on error.
+    """
+    if name.startswith("disp-vm-") or name.startswith("work-sys-"):
+        if not vm_exists(name):
+            print(f"Error: VM '{name}' does not exist")
+            sys.exit(1)
+        return name
+
+    disp = f"disp-vm-{name}"
+    work = f"work-sys-{name}"
+    disp_exists = vm_exists(disp)
+    work_exists = vm_exists(work)
+
+    if disp_exists and work_exists:
+        print(f"Error: Ambiguous name '{name}' - both {disp} and {work} exist.")
+        print("Use the full libvirt name to disambiguate.")
+        sys.exit(1)
+    if disp_exists:
+        return disp
+    if work_exists:
+        return work
+    print(f"Error: No managed VM found for '{name}' (looked for {disp}, {work})")
+    sys.exit(1)
 
 
 def get_template_xml() -> str:
@@ -640,30 +699,52 @@ def update_template() -> bool:
     return True
 
 
+def ensure_running_with_ip(name: str) -> str:
+    """Start the VM if needed and wait for the guest agent to report an IP.
+
+    Returns the IP on success, or None on failure (with the error already printed).
+    """
+    config = load_config()
+    net_prefix = config["network"]["prefix"]
+    try:
+        timeout = int(config["network"].get("connect_timeout", "60"))
+    except ValueError:
+        timeout = 60
+
+    if not vm_is_running(name):
+        print(f"VM '{name}' is not running - starting it...")
+        result = run_virsh(["start", name])
+        if result.returncode != 0:
+            print(f"Error starting VM: {result.stderr}")
+            return None
+
+    print(f"Waiting for {name} to report an IP (up to {timeout}s)...")
+    ip = wait_for_vm_ip(name, net_prefix, timeout)
+    if not ip:
+        print(f"Error: VM '{name}' did not report an IP within {timeout}s")
+        print(f"Looking for IP starting with: {net_prefix}")
+        print("Ensure qemu-guest-agent is installed and running in the VM")
+        return None
+    return ip
+
+
 def connect_vm(name: str) -> bool:
-    """Connect to VM via RDP using Remmina."""
+    """Connect to VM via RDP using Remmina.
+
+    Auto-starts the VM if it isn't running and waits for the guest agent
+    to report an IP before launching Remmina.
+    """
     log("appvm", "CONNECT", message=f"Connecting to VM: {name}")
 
     if not vm_exists(name):
         print(f"Error: VM '{name}' does not exist")
         return False
 
-    if not vm_is_running(name):
-        print(f"Error: VM '{name}' is not running")
+    ip = ensure_running_with_ip(name)
+    if ip is None:
         return False
 
-    # Load config
     config = load_config()
-    net_prefix = config["network"]["prefix"]
-
-    # Get VM IP
-    ip = get_vm_ip(name, net_prefix)
-    if not ip:
-        print(f"Error: Could not get IP for VM '{name}'")
-        print(f"Looking for IP starting with: {net_prefix}")
-        print("Ensure qemu-guest-agent is running in the VM")
-        return False
-
     username = config["rdp"].get("username")
     password = config["rdp"].get("password")
 
@@ -692,6 +773,53 @@ def connect_vm(name: str) -> bool:
                      stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL)
     return True
+
+
+def ssh_vm(name: str) -> bool:
+    """SSH into VM.
+
+    Auto-starts the VM if it isn't running and waits for the guest agent
+    to report an IP. Because appvm root filesystems reset on every boot,
+    the VM's SSH host keys change each start - we therefore skip host-key
+    checking/recording so users don't get MITM warnings on every use.
+
+    Replaces the Python process with ssh via execvp so keystrokes, TTY
+    allocation, and exit codes pass through naturally.
+    """
+    log("appvm", "SSH", message=f"SSH to VM: {name}")
+
+    if not vm_exists(name):
+        print(f"Error: VM '{name}' does not exist")
+        return False
+
+    ip = ensure_running_with_ip(name)
+    if ip is None:
+        return False
+
+    config = load_config()
+    # Username resolution: [ssh].user -> [sshfs].remote_user -> [rdp].username -> $USER
+    ssh_user = (
+        config.get("ssh", {}).get("user")
+        or config.get("sshfs", {}).get("remote_user")
+        or config.get("rdp", {}).get("username")
+        or os.environ.get("USER")
+    )
+    target = f"{ssh_user}@{ip}" if ssh_user else ip
+
+    ssh_cmd = [
+        "ssh",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "LogLevel=ERROR",
+        target,
+    ]
+    log_command("appvm", "SSH_EXEC", ssh_cmd)
+    print(f"Connecting to {target} via SSH...")
+    try:
+        os.execvp("ssh", ssh_cmd)
+    except FileNotFoundError:
+        print("Error: 'ssh' command not found. Install openssh-client.")
+        return False
 
 
 def install_guest(template_disk: Path) -> bool:
@@ -826,10 +954,28 @@ def main():
 
     if command == "create":
         if len(sys.argv) < 4:
-            print("Usage: appvm create <disp|work> <name>")
+            print("Usage: appvm create <disp|work> <name> [-s|--start] [-c|--connect] [--ssh]")
             sys.exit(1)
         vm_type = sys.argv[2]
         name = sys.argv[3]
+
+        flag_start = False
+        flag_connect = False
+        flag_ssh = False
+        for arg in sys.argv[4:]:
+            if arg in ("-s", "--start"):
+                flag_start = True
+            elif arg in ("-c", "--connect"):
+                flag_connect = True
+            elif arg == "--ssh":
+                flag_ssh = True
+            else:
+                print(f"Error: Unknown argument '{arg}'")
+                sys.exit(1)
+
+        if flag_connect and flag_ssh:
+            print("Error: --connect and --ssh are mutually exclusive")
+            sys.exit(1)
 
         # Validate name (alphanumeric and hyphens only)
         if not re.match(r'^[a-zA-Z0-9-]+$', name):
@@ -838,40 +984,59 @@ def main():
 
         if vm_type == "disp":
             success = create_disp_vm(name)
+            full_name = f"disp-vm-{name}"
         elif vm_type == "work":
             success = create_work_vm(name)
+            full_name = f"work-sys-{name}"
         else:
             print(f"Error: Unknown VM type '{vm_type}'. Use 'disp' or 'work'")
             sys.exit(1)
 
-        sys.exit(0 if success else 1)
+        if not success:
+            sys.exit(1)
+
+        # --connect and --ssh each imply --start (they call ensure_running_with_ip).
+        if flag_ssh:
+            sys.exit(0 if ssh_vm(full_name) else 1)
+        if flag_connect:
+            sys.exit(0 if connect_vm(full_name) else 1)
+        if flag_start:
+            sys.exit(0 if start_vm(full_name) else 1)
+        sys.exit(0)
 
     elif command == "start":
         if len(sys.argv) < 3:
             print("Usage: appvm start <name>")
             sys.exit(1)
-        success = start_vm(sys.argv[2])
+        success = start_vm(resolve_vm_name(sys.argv[2]))
         sys.exit(0 if success else 1)
 
     elif command == "stop":
         if len(sys.argv) < 3:
             print("Usage: appvm stop <name>")
             sys.exit(1)
-        success = stop_vm(sys.argv[2])
+        success = stop_vm(resolve_vm_name(sys.argv[2]))
         sys.exit(0 if success else 1)
 
     elif command == "connect":
         if len(sys.argv) < 3:
             print("Usage: appvm connect <name>")
             sys.exit(1)
-        success = connect_vm(sys.argv[2])
+        success = connect_vm(resolve_vm_name(sys.argv[2]))
+        sys.exit(0 if success else 1)
+
+    elif command == "ssh":
+        if len(sys.argv) < 3:
+            print("Usage: appvm ssh <name>")
+            sys.exit(1)
+        success = ssh_vm(resolve_vm_name(sys.argv[2]))
         sys.exit(0 if success else 1)
 
     elif command == "destroy":
         if len(sys.argv) < 3:
             print("Usage: appvm destroy <name>")
             sys.exit(1)
-        success = destroy_vm(sys.argv[2])
+        success = destroy_vm(resolve_vm_name(sys.argv[2]))
         sys.exit(0 if success else 1)
 
     elif command == "list":

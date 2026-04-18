@@ -31,6 +31,10 @@ username = user
 # Network prefix for VM IP detection (via qemu-guest-agent)
 prefix = 192.168.122.
 
+# Seconds to wait for the guest agent to report an IP when using
+# 'appvm connect' (also applies to 'appvm create ... --connect').
+connect_timeout = 60
+
 [guest]
 # Minimum UID for creating home directories in work VMs
 # Users with UID below this are considered system users and skipped
@@ -47,3 +51,8 @@ mount_dir = /mnt/vm
 
 # SSH username on guest VMs (defaults to rdp.username if not set)
 # remote_user = user
+
+[ssh]
+# Settings for 'appvm ssh'. Username resolution order:
+#   [ssh].user  ->  [sshfs].remote_user  ->  [rdp].username  ->  $USER
+# user = user

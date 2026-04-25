@@ -13,6 +13,11 @@ LOG_DIR="/var/log/kvm-appvm"
 HOOK_SOURCE="$SCRIPT_DIR/hooks/qemu"
 HOOK_TARGET="/etc/libvirt/hooks/qemu"
 
+# Tracks whether install.sh added or changed the hook this run.
+# libvirtd only registers hooks at daemon start / reload, so any change
+# requires a `systemctl reload` for VMs to actually invoke the hook.
+HOOK_CHANGED=0
+
 echo "=== kvm-appvm Host Installation ==="
 echo
 
@@ -30,42 +35,49 @@ chmod 755 "$LOG_DIR"
 echo "  Done."
 echo
 
-# Handle QEMU hook installation
+# Handle QEMU hook installation.
+#
+# We *copy* the hook into /etc/libvirt/hooks/ rather than symlinking it.
+# AppArmor's libvirtd profile (Debian/Ubuntu) restricts hook execution to
+# /etc/libvirt/hooks/**, so a symlink to a script under /home/... is
+# refused with "Permission denied" even though file modes look fine.
+# Trade-off: the user must re-run install.sh after editing hooks/qemu.
 echo "Installing QEMU hook..."
+mkdir -p "$(dirname "$HOOK_TARGET")"
 
-if [[ -e "$HOOK_TARGET" ]]; then
-    if [[ -L "$HOOK_TARGET" ]]; then
-        # It's a symlink - check if it points to our script
-        current_target=$(readlink -f "$HOOK_TARGET")
-        if [[ "$current_target" == "$HOOK_SOURCE" ]]; then
-            echo "  QEMU hook already installed correctly."
-        else
-            echo "  Existing symlink found pointing to: $current_target"
-            echo "  Backing up to: ${HOOK_TARGET}.backup"
-            mv "$HOOK_TARGET" "${HOOK_TARGET}.backup"
-            ln -s "$HOOK_SOURCE" "$HOOK_TARGET"
-            echo "  Created new symlink: $HOOK_TARGET -> $HOOK_SOURCE"
-        fi
-    else
-        # It's a regular file - back it up
-        echo "  Existing hook file found."
-        echo "  Backing up to: ${HOOK_TARGET}.backup"
-        mv "$HOOK_TARGET" "${HOOK_TARGET}.backup"
-        ln -s "$HOOK_SOURCE" "$HOOK_TARGET"
-        echo "  Created symlink: $HOOK_TARGET -> $HOOK_SOURCE"
-    fi
+if [[ -L "$HOOK_TARGET" ]]; then
+    echo "  Removing legacy symlink at $HOOK_TARGET"
+    rm -f "$HOOK_TARGET"
+fi
+
+if [[ -e "$HOOK_TARGET" ]] && cmp -s "$HOOK_SOURCE" "$HOOK_TARGET"; then
+    echo "  QEMU hook already up to date."
 else
-    # Create hooks directory if needed
-    mkdir -p "$(dirname "$HOOK_TARGET")"
-    ln -s "$HOOK_SOURCE" "$HOOK_TARGET"
-    echo "  Created symlink: $HOOK_TARGET -> $HOOK_SOURCE"
+    if [[ -e "$HOOK_TARGET" ]]; then
+        echo "  Existing hook differs - backing up to: ${HOOK_TARGET}.backup"
+        mv "$HOOK_TARGET" "${HOOK_TARGET}.backup"
+    fi
+    install -m 0755 "$HOOK_SOURCE" "$HOOK_TARGET"
+    echo "  Installed: $HOOK_TARGET (copied from $HOOK_SOURCE)"
+    HOOK_CHANGED=1
 fi
 echo
 
-# Verify hook is executable
-if [[ ! -x "$HOOK_SOURCE" ]]; then
-    chmod +x "$HOOK_SOURCE"
-    echo "Made hook script executable."
+# Reload libvirtd so the hook is registered. Without this the daemon
+# silently ignores the hook and overlay disks never get created on start.
+if [[ "$HOOK_CHANGED" -eq 1 ]]; then
+    for unit in libvirtd virtqemud; do
+        if systemctl list-unit-files "$unit.service" >/dev/null 2>&1 \
+                && systemctl is-active --quiet "$unit"; then
+            echo "Reloading $unit so the new hook is picked up..."
+            if systemctl reload "$unit"; then
+                echo "  Reloaded $unit."
+            else
+                echo "  WARNING: Failed to reload $unit. Run 'sudo systemctl reload $unit' manually."
+            fi
+        fi
+    done
+    echo
 fi
 
 echo "=== Host Installation Complete ==="

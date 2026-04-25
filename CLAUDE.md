@@ -113,7 +113,7 @@ Keep it minimal - don't over-engineer.
 
 **Template disk** - Default location `/VM/kvm/template-root.qcow2` (configurable via `paths.template_disk`). This is a working template - DO NOT modify or damage it. Always create overlays that use it as a backing store. If modification is absolutely necessary, ask the user for explicit permission first.
 
-**QEMU hooks** - Symlink `/etc/libvirt/hooks/qemu` to this project's hook script. The hook:
+**QEMU hooks** - `install.sh` copies `hooks/qemu` to `/etc/libvirt/hooks/qemu` and reloads `libvirtd` so the daemon registers it. We *copy* (not symlink) because Debian/Ubuntu's AppArmor `libvirtd` profile only permits exec under `/etc/libvirt/hooks/**`; a symlink to a path under `/home/...` is denied with "Permission denied" (exit 126) even with mode 0755. Trade-off: re-run `install.sh` after editing `hooks/qemu`. The hook:
 - Creates overlay disk on VM start (using template as backing store)
 - Sets hostname by writing `/etc/hostname` directly to the overlay before boot (via qemu-nbd loop-mount)
 
